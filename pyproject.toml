@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fmkorea-scraper"
+version = "0.1.0"
+description = "Scrapling based FMKorea scraper"
+requires-python = ">=3.11"
+dependencies = [
+  "scrapling[fetchers]>=0.4.15,<0.5",
+  "pydantic>=2,<3",
+  "python-dotenv>=1,<2",
+  "polars>=1,<2",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1,<2"]
+postgres = ["psycopg[binary]>=3,<4"]
+mcp = ["mcp>=1,<2"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+fmkorea-scraper = "fmkorea_scraper.adapters.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

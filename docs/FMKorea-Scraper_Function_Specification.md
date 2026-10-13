@@ -880,6 +880,7 @@
   - graceful stop 시 최종 crawler state를 저장하고, 같은 `crawldir`로 Spider를 다시 시작하면 **Scrapling scheduler state**를 복원하며 `start_requests()`를 다시 실행하지 않는다.
   - 정상 완료 시 Scrapling crawler checkpoint는 자동 정리되는 것을 기본 동작으로 사용한다.
   - Scrapling crawler checkpoint는 pickle 기반의 내부 상태이므로 프로그램이 직접 생성한 신뢰 가능한 `crawldir`만 복원 대상으로 사용하고 사용자 임의 파일을 로드하지 않는다.
+  - Browser fallback의 pending `Request`도 crawler checkpoint에 포함될 수 있다. request-local `page_action`은 pickle 가능한 모듈 최상위 callable로 구성하고, Spider instance를 캡처하는 지역 함수/클로저를 사용하지 않는다. 복원된 callable은 새 Spider process의 runtime-only identity bridge를 사용하며, cookie/UA 자체는 checkpoint에 저장하지 않는다.
   - `crawldir` resume이 복원하는 대상은 Scrapling scheduler의 pending request/seen set이며, 애플리케이션의 `ProxyRotator` index, Proxy별 `BrowserIdentityState`, HTTP/Browser cookie jar 또는 실제 Browser context 같은 runtime-only 상태까지 복원하는 것으로 표현하지 않는다.
 - 애플리케이션 Job checkpoint
   - 최상위 타입은 `Checkpoint`다.
@@ -946,6 +947,7 @@
   - 위 status code는 모두 Scrapling blocked-retry 경로와 Stealthy Browser fallback 대상이다. `500/502/503/504`도 server/transient failure로 별도 분리하지 않고 Scrapling 기본 blocked 처리에 포함한다.
   - `404`와 `410`은 삭제/비공개/존재하지 않음으로 의미가 명확하므로 Blocking으로 취급하지 않는다. 여기서 `종료`는 **해당 request/게시글 처리만 종료(skip)**한다는 뜻이며 Job/Spider 전체는 계속 실행한다.
   - 그 밖의 status code는 Scrapling 기본 status 판정만으로 Blocking 처리하지 않는다. 다만 status가 정상이어도 FMKorea 전용 차단 문구나 차단 페이지 패턴이 감지되면 `is_blocked()` override에서 추가로 `true`를 반환할 수 있다.
+  - HTTP `200` 응답이라도 앞부분 4096 byte에 `<title>에펨코리아 보안 시스템</title>`에 해당하는 보안 화면 표식이 있으면 목록·검색·상세 파서보다 먼저 Blocking으로 분류한다. 차단 화면의 필수 DOM 누락을 parser-stage 실패로 기록하지 않는다.
   - Scrapling engine은 blocked request의 retry copy를 만든 뒤 `FMKoreaSpider.retry_blocked_request()`에 전달한다. 이 hook은 요청 phase에 따라 **HTTP Blocking → 같은 Proxy의 Browser fallback**, **Browser Blocking → 다음 Proxy를 선택한 새 HTTP logical attempt**를 구성한다.
   - 이 전환은 Scrapling의 built-in blocked retry 경로를 사용하며, retry request는 `dont_filter=True`로 재큐잉되는 Scrapling 기본 동작을 따른다.
   - `max_blocked_retries`는 HTTP↔Browser 사이의 전환을 모두 합산한 **해당 logical request의 blocked retry Request 개수**다. 기본값 `3`이면 `HTTP(P1) → Browser(P1) → HTTP(P2) → Browser(P2)`까지 시도한다. HTTP→Browser fallback도 하나의 retry budget을 소비한다.
@@ -975,7 +977,10 @@
 - Scrapling ProxyRotator 기반 HTTP → Browser logical-attempt 전환
   - 목록, 검색, 상세 HTML은 Scrapling `Selector`로 파싱한다.
   - 새 logical crawl request와 Browser-blocked 이후의 새 HTTP retry attempt는 `ProxyAttemptCoordinator`에서 **Scrapling `ProxyRotator.get_proxy()`를 정확히 한 번 호출**해 다음 Proxy를 선택한다. session에 `proxy_rotator=`를 직접 주입하여 내부 transport retry 도중 Proxy가 바뀌게 하지 않는다.
-  - `configure_sessions()`에서 configured Proxy마다 `manager.add("http:<proxy_id>", FetcherSession(proxy=<that_proxy>, follow_redirects="safe", ...), lazy=True)`와 `manager.add("browser:<proxy_id>", AsyncStealthySession(proxy=<that_proxy>, headless=True, google_search=False, max_pages=<crawl_config.browser_max_pages>, timeout=<browser_timeout_ms>, ...), lazy=True)`를 등록한다. Proxy를 사용하지 않을 때는 direct HTTP/Browser session만 등록한다.
+  - `configure_sessions()`에서 configured Proxy마다 `manager.add("http:<proxy_id>", FetcherSession(proxy=<that_proxy>, follow_redirects="safe", ...), lazy=True)`와 `manager.add("browser:<proxy_id>", AsyncStealthySession(proxy=<browser_transport_proxy>, headless=True, google_search=False, hide_canvas=True, block_webrtc=True, solve_cloudflare=True, allow_webgl=True, max_pages=<crawl_config.browser_max_pages>, timeout=<browser_timeout_ms>, ...), lazy=True)`를 등록한다. Proxy를 사용하지 않을 때는 direct HTTP/Browser session만 등록한다. 네 가지 stealth 전용 옵션을 모두 명시하며, `solve_cloudflare`는 Cloudflare 챌린지용이므로 FMKorea 자체 보안 화면의 해제를 보장하지 않는다.
+  - 인증된 SOCKS5 Proxy는 HTTP Fetcher에 원래 `socks5://` URL을 직접 전달한다. Chromium Browser session은 SOCKS5 username/password 인증을 직접 처리하지 못하므로 Spider 실행 중 해당 Proxy마다 `127.0.0.1`의 임시 HTTP CONNECT 중계기를 열어 `browser_transport_proxy`로 전달한다. 중계기는 HTTP CONNECT를 동일한 SOCKS5 upstream으로 연결하고 Spider 종료 시 닫는다. 그 외 Proxy는 원래 URL을 Browser session에 전달한다.
+  - 중계기는 `port=0`으로 OS에 임시 포트 선택을 요청한다. Windows에서 포트 예약 또는 충돌로 바인딩이 `10013`/`10048`을 반환하면 새 포트로 최대 5회 시도하고, 계속 실패하면 설정/실행 오류로 중단한다. 열린 중계기는 이후 Proxy 설정 중 오류가 나더라도 닫는다.
+  - 중계기의 임시 포트는 Proxy pool 순서, exact-resume fingerprint, `proxy_id`, 영속 checkpoint에 포함하지 않는다. `proxy_log.endpoint`에는 로컬 중계 주소가 아닌 인증정보를 제거한 원래 Proxy endpoint를 기록한다. `Response.meta["proxy"]`의 실제 Browser 전송 주소를 검사할 때만 해당 Proxy의 로컬 중계 주소와 비교한다.
   - **HTTP 세션도 Proxy별로 분리**해 HTTP cookie jar가 다른 Proxy로 누출되지 않도록 한다. **Browser 세션도 Proxy별로 고정**해 persistent Browser context/cookie/UA를 같은 egress Proxy에 귀속시킨다. session-level 고정 Proxy를 사용하므로 Browser 요청마다 per-request `proxy=`로 임시 Browser context를 생성하는 경로에 의존하지 않는다.
   - 따라서 본 명세에서 `Browser mode`, `Stealthy Browser`, `Browser fallback`은 별도 언급이 없는 한 Scrapling `StealthyFetcher`/`AsyncStealthySession` 계열의 stealth browser 경로를 의미한다. 일반 `DynamicFetcher`/`AsyncDynamicSession`은 Blocking fallback 기본 경로로 사용하지 않는다.
   - `lazy=True`는 `AsyncStealthySession` 생성자 인자가 아니라 `SessionManager.add()`의 인자다.
@@ -988,12 +993,12 @@
   - `sanitize_proxy_ref()`는 string proxy URL과 Playwright-style dict에서 username/password/query 등을 버리고 endpoint만 생성한다. `proxy_log` 외에도 failure JSONL/JobReport/checkpoint/구조화 로그에 credential-bearing `Response.meta["proxy"]` 원문, Proxy 암호, Cookie, 인증 header를 저장하지 않는다.
   - 본 명세의 HTML crawl request는 GET navigation으로 한정한다. HTTP request의 `method`/`params`/`data`/`json` 같은 전용 kwargs를 Browser session에 그대로 전달하지 않는다. 검색 query는 URL builder 단계에서 URL에 포함한다.
   - `retry_blocked_request()`는 HTTP request header 전체를 Browser `extra_headers`로 복사하지 않는다. 기본 Browser-safe 전달 allowlist는 **`Referer`만** 사용하고, 향후 FMKorea가 특정 custom header를 실제로 요구하는 경우에만 명시적으로 allowlist에 추가한다. `User-Agent`, `Sec-CH-UA*`, `Cookie`, `Host`, `Content-Length`, `Accept-Encoding`, `Proxy-Authorization` 등 browser/network identity 또는 전송 계층이 직접 관리해야 하는 header는 HTTP request에서 Browser로 복사하지 않는다.
+  - Browser retry request의 identity capture `page_action`은 `crawldir`의 pending request로 직렬화할 수 있어야 한다. callable에는 `job_id`, `proxy_id`, `capture_seq`처럼 재구성 가능한 비밀정보 없는 식별자만 담고, Spider/Browser page를 캡처한 지역 클로저와 raw cookie/UA를 넣지 않는다. 복원된 request는 새 Spider가 등록한 identity bridge를 사용한다.
   - 위 allowlist 적용 후 HTTP 전용 kwargs를 제거하고 Browser 전용 `wait_selector`/timeout 등을 추가한다. Browser의 User-Agent/client hints/cookie는 Browser context 자체가 관리하며 HTTP 쪽 identity 값을 `extra_headers`로 억지로 덮어쓰지 않는다.
   - 향후 non-GET endpoint를 crawl 대상으로 추가한다면 Browser fallback에서 단순 `sid` 전환으로 처리하지 않고 `page_action`/XHR 호출 등 동등한 Browser 동작을 별도 정의해야 한다.
   - page 종류별 Browser 준비 조건이 필요하면 `Request.meta`에 `page_kind`/`required_selector`를 저장하고 Browser retry 시 `wait_selector` 같은 Browser 전용 인자로 변환한다.
   - Proxy별 Browser session은 `lazy=True`로 등록하고 실제 fallback 시에만 시작하여 같은 Proxy의 후속 fallback에 재사용한다. 단일 configured Proxy당 Browser page pool 상한은 `browser_max_pages`다.
-  - **구현 검증 메모:** "스모킹 테스트 후 `FMKorea의 HTTP Blocking으로 인한 Browser Fallback` 빈도 및 패턴 분석에 따라 sticky를 재도입할 수도 있음". 현 단계에서는 sticky를 구현하거나 관련 설정을 남기지 않는다. 재도입을 결정할 때는 HTTP Blocking 비율, 연속 발생 구간, Proxy별 fallback 성공률, Browser 대비 HTTP 처리 비용을 `proxy_log`로 먼저 평가하고 Proxy/identity affinity 정책과 함께 재설계한다.
-  - 스모킹 테스트에서는 최소 `HTTP(P1)→Browser(P1) 성공`, `HTTP(P1)→Browser(P1) Blocking→HTTP(P2)`, Proxy별 cookie 격리, `Response.meta["proxy_log"]` 이력/credential redaction, transport timeout 시 Proxy 유지, 재시작 시 Proxy mapping 검증을 확인한다.
+  - 현재 라우팅 정책은 logical request별 HTTP→Browser 전환이며 전역 sticky/probe 상태와 관련 설정을 두지 않는다. 향후 sticky 정책이 필요하면 HTTP Blocking 비율, Proxy별 fallback 성공률, Browser 대비 HTTP 처리 비용을 근거로 Proxy/identity affinity와 함께 재설계한다.
   - 로컬 및 Docker 실행 환경은 Browser 전환이 항상 가능하도록 `scrapling[fetchers]`와 Playwright browser를 설치한다.
   - Docker image는 `.[s3,postgres]`와 기본 의존성 `scrapling[fetchers]`를 설치하고 `scrapling install`을 수행하여 Browser mode 실행 준비를 image build 단계에서 끝낸다.
   - 목록/게시판 검색 필수 DOM은 `div.bd`, 통합 검색 필수 DOM은 `.searchResult, .search_result`, 게시글 상세 필수 DOM은 `#bd_capture`를 기준으로 한다.
@@ -1035,7 +1040,7 @@
   - Proxy는 **Job당 하나의 Scrapling `ProxyRotator` + configured Proxy pool**로 구성한다. 새 HTTP logical attempt에 한하여 `get_proxy()`를 호출하고, 각 Proxy에 대응하는 고정 HTTP/Browser session을 선택한다. Proxy 하나만 설정된 경우에도 같은 로직을 사용하며 동일 Proxy가 반복 선택된다.
   - configured Proxy마다 안전한 `proxy_id`(예: `proxy-0001`)를 부여한다. `proxy_id`와 session mapping은 해당 실행/ exact-resume의 Proxy pool 순서와 항목에 대해 안정적이어야 하며 비밀정보를 담지 않는다.
   - `BrowserIdentityStore: dict[proxy_id, BrowserIdentityState]`는 각 Proxy에 대응하는 cookie/UA/Chrome major만 보관한다. HTTP `FetcherSession`과 Browser `AsyncStealthySession` 모두 Proxy별로 생성해 cookie jar와 network identity를 격리한다.
-  - '동일 Proxy 유지'는 애플리케이션이 동일한 proxy endpoint 및 인증/세션 설정을 선택한다는 의미다. Rotating residential gateway처럼 **같은 endpoint가 요청마다 다른 출구 IP를 할당하는 공급자**에서는 실제 egress IP가 유지된다고 보장할 수 없다. IP 고정이 필수인 Proxy 제공자는 sticky-session credential/parameter 등을 지원해야 하며 이 동작은 스모킹 테스트에서 별도 확인한다.
+  - '동일 Proxy 유지'는 애플리케이션이 동일한 proxy endpoint 및 인증/세션 설정을 선택한다는 의미다. Rotating residential gateway처럼 **같은 endpoint가 요청마다 다른 출구 IP를 할당하는 공급자**에서는 실제 egress IP가 유지된다고 보장할 수 없다. IP 고정이 필수인 Proxy 제공자는 sticky-session credential/parameter 등을 지원해야 하며 배포 환경에서 실제 egress IP 유지 여부를 확인해야 한다.
   - 애플리케이션 설정 소스로는 CLI/마법사에서 명시한 값과 실행 위치의 `.env`만 사용하며, `HTTP_PROXY`, `HTTPS_PROXY` 같은 시스템 환경변수를 구성 소스로 사용하지 않는다.
   - Proxy는 CLI/마법사에서 명시 입력한 값 또는 실행 위치의 `.env` 파일 값만 사용한다.
   - Proxy 설정은 실행 파일과 같은 위치의 `.env` 파일에 저장한다.
@@ -1367,7 +1372,7 @@
   - Proxy는 HTTP/Browser 두 session에 동일 정책으로 주입한다.
   - `.env` 파일 기반 Proxy 환경변수 로드를 지원한다.
   - HTTP와 Browser session은 각각 독립적인 cookie/session state를 유지한다. Browser fallback에서는 readiness 완료 후 candidate identity를 캡처하고, `BrowserIdentityBridge`가 non-blocked/fresh candidate만 active state로 승격한다. HTTP에는 active first-party cookie를 항상 동기화하고 raw Browser User-Agent는 exact Chrome-major impersonation profile이 확인된 경우에만 conditional overlay한다.
-  - request routing은 전역 adaptive state 대신 각 logical request의 `HTTP(Pn) → Browser(Pn)` 체인을 사용한다. Browser phase도 Blocking이면 남은 blocked retry budget으로 `HTTP(Pn+1)`를 시작한다. 스모킹 테스트 전에는 전역 sticky/probe를 사용하지 않는다.
+  - request routing은 전역 adaptive state 대신 각 logical request의 `HTTP(Pn) → Browser(Pn)` 체인을 사용한다. Browser phase도 Blocking이면 남은 blocked retry budget으로 `HTTP(Pn+1)`를 시작한다. 전역 sticky/probe는 사용하지 않는다.
 - 파싱 런타임
   - Scrapling `Selector` 기반 HTML 파싱
   - Spider callback에 전달된 `Response`는 이미 Scrapling `Selector` 기능을 제공하므로 `Response.body`/HTML 문자열을 BeautifulSoup, lxml, 새 `Selector(...)`로 다시 파싱하지 않는다.
@@ -1609,13 +1614,13 @@ docker run --rm `
 - 크롤링 실행 엔진은 Scrapling `Spider`를 기준으로 구현한다.
 - Spider는 request scheduling, callback routing, concurrency, deduplication, blocked retry, pause/resume을 담당한다. 일반 Job은 scheduler가 빌 때 종료되는 1회 crawl이고, 실시간 Job은 하나의 장기 실행 Spider가 polling callback을 통해 다음 poll request를 이어서 생성한다.
 - HTTP와 Browser는 별도 프로세스가 아니라 같은 Spider 안의 multi-session으로 구성한다.
-- Proxy가 설정된 경우 `ProxyRotator`가 고른 `proxy_id`에 대응하는 `manager.add("http:<proxy_id>", FetcherSession(proxy=<that_proxy>, ...), lazy=True)` 및 `manager.add("browser:<proxy_id>", AsyncStealthySession(proxy=<that_proxy>, ...), lazy=True)`를 사용한다. 첫 HTTP session을 manager의 default로 등록할 수 있지만 새 logical request의 `sid`는 항상 선택된 Proxy에 맞게 명시한다. Proxy가 없으면 direct `http`/`browser` session만 사용한다.
+- Proxy가 설정된 경우 `ProxyRotator`가 고른 `proxy_id`에 대응하는 `manager.add("http:<proxy_id>", FetcherSession(proxy=<that_proxy>, ...), lazy=True)` 및 `manager.add("browser:<proxy_id>", AsyncStealthySession(proxy=<browser_transport_proxy>, ...), lazy=True)`를 사용한다. 인증된 SOCKS5의 Browser 전송 주소는 위의 loopback 중계 주소다. 첫 HTTP session을 manager의 default로 등록할 수 있지만 새 logical request의 `sid`는 항상 선택된 Proxy에 맞게 명시한다. Proxy가 없으면 direct `http`/`browser` session만 사용한다.
 - `StealthyFetcher.fetch()` 같은 one-off 호출은 standalone 단발성 진단에는 사용할 수 있으나, Spider fallback 계약에서는 사용하지 않는다. 동일 Proxy의 Browser context/cookie/UA를 유지하기 위해 Proxy별 `AsyncStealthySession`을 lazy 재사용한다.
 - `FMKoreaSpider.is_blocked()`의 status-code 기준은 Scrapling 기본 `BLOCKED_CODES={401,403,407,429,444,500,502,503,504}`를 그대로 따른다. FMKorea 전용 차단 body/content 패턴만 추가 판정하고, `404/410`은 삭제·비공개 결과로 별도 처리한다.
 - 새 logical request는 `ProxyAttemptCoordinator`가 `ProxyRotator.get_proxy()`로 Proxy 하나를 선택한 HTTP session에서 시작한다. HTTP Blocking이면 `retry_blocked_request()`가 원 logical context/`proxy_attempt`/`proxy_id`를 유지하여 **동일 Proxy의 Browser session**으로 전환한다.
 - Browser도 Blocking이면 잔여 blocked retry budget에서 **새 HTTP logical attempt**를 시작하며 rotator가 다음 Proxy를 선택한다. 기본 `max_blocked_retries=3`이면 `HTTP(P1) → Browser(P1) → HTTP(P2) → Browser(P2)`까지 시도한다. transport retry는 선택된 Proxy를 유지한다.
 - Browser fallback에서는 `BrowserPageActionComposer`가 readiness 완료 후 `proxy_id`, cookie, UA, Chrome major를 `BrowserIdentityCandidate`로 캡처하고, `BrowserIdentityBridge`는 non-blocked이며 해당 Proxy slot에서 최신 `capture_seq`인 candidate만 `BrowserIdentityStore[proxy_id]`로 승격한다.
-- Browser fallback 성공 후의 새로운 logical request도 rotator를 통한 HTTP 요청으로 시작한다. 전역 Browser sticky/http probe는 현재 구현하지 않으며, 스모킹 테스트에서 **FMKorea의 HTTP Blocking으로 인한 Browser Fallback 빈도 및 패턴**을 분석한 뒤 sticky 재도입을 검토할 수 있다.
+- Browser fallback 성공 후의 새로운 logical request도 rotator를 통한 HTTP 요청으로 시작한다. 전역 Browser sticky/http probe는 사용하지 않는다.
 - `max_blocked_retries`는 HTTP/Browser 전환을 합산한 1 이상의 홀수 blocked retry Request budget이다. 마지막 Browser도 Blocking이면 `terminal_blocked` 후 `pause()`로 crawler state를 보존하고 runner는 `status="stopped"`, `reason="blocked"`를 저장한다.
 - Scrapling `crawldir`는 pending request/seen set을 저장하되 rotator 순서와 Proxy별 cookie/UA/Browser context를 복원하지 않는다. exact resume에서 pending request의 `proxy_id` mapping은 배포 Proxy pool과 일치해야 한다.
 - 각 `Response.meta["proxy_log"]`는 secret이 제거된 Proxy 이력과 phase/Blocking 판정을 포함한다. raw `Response.meta["proxy"]`의 credential은 영속 로그에 기록하지 않는다.
@@ -2029,7 +2034,7 @@ docker run --rm `
 - `max_blocked_retries`는 1 이상의 **홀수 정수**여야 한다. `0`은 필수 Browser fallback을 비활성화하고 짝수는 마지막 retry가 HTTP에서 끝나 logical-attempt pair를 완성하지 못하므로 거부한다.
 - `download_delay`, `checkpoint_interval_seconds`, timeout 값은 0보다 커야 한다.
 - Blocking response 재시도와 transport exception 재시도는 서로 다른 계층이다. `--max-blocked-retries`를 session transport retry와 합산하지 않는다.
-- ProxyRotator 기반 logical-attempt routing과 동일 Proxy 내 Browser identity → HTTP 동기화는 고정 실행 정책이며 별도 enable/disable CLI 옵션을 두지 않는다. sticky 설정은 현재 제거하고 스모킹 테스트 결과에 따라 추후 재평가한다.
+- ProxyRotator 기반 logical-attempt routing과 동일 Proxy 내 Browser identity → HTTP 동기화는 고정 실행 정책이며 별도 enable/disable CLI 옵션을 두지 않는다. 전역 sticky 설정은 제공하지 않는다.
 
 #### 8.2.6. Proxy CLI 옵션
 
@@ -2042,7 +2047,7 @@ docker run --rm `
 - CLI에서 `--proxy-host`를 하나 이상 명시하면 `.env`보다 우선하며 입력 순서대로 Proxy pool을 구성한다.
 - `--proxy-host`가 없고 실행 위치에 `.env`가 있으면 `.env`의 Proxy 값을 자동 사용한다.
 - 시스템 환경변수의 `HTTP_PROXY`, `HTTPS_PROXY`는 자동 사용하지 않는다.
-- 기존 `FMKOREA_PROXY_HOST`만 확장하며 새 환경변수를 추가하지 않는다. 단일 URL은 그대로 지원하고 여러 Proxy는 `;`로 구분한다. 예: `http://p1:8080;http://p2:8080`. 빈 항목/중복 Proxy는 입력 validation에서 거부한다.
+- 기존 `FMKOREA_PROXY_HOST`만 확장하며 새 환경변수를 추가하지 않는다. 단일 URL은 그대로 지원하고 여러 Proxy는 `;`로 구분한다. 예: `socks5://p1:1080;socks5://p2:1080`. SOCKS5 전용 서비스는 `socks5://`를 명시해야 한다. scheme을 생략한 host는 기존 호환성을 위해 `http://`로 해석한다. 빈 항목/중복 Proxy는 입력 validation에서 거부한다.
 - `--proxy-id` 및 `FMKOREA_PROXY_ID`는 **인증용 username**으로서 내부의 safe `proxy_id=proxy-0001`과 다른 개념이다. `--proxy-pw`/`FMKOREA_PROXY_PW`는 인증정보가 없는 URL에만 적용되는 shared password다. Proxy별 credentials가 다르면 해당 URL에 포함해 제공하되 URL 자체를 로그에 남기지 않는다.
 - Proxy pool의 항목/순서는 한 exact-resume Job의 pending request `proxy_id` mapping과 일관되게 유지한다. Proxy pool이 비활성화되어 있으면 direct HTTP/Browser만 사용한다. Pool이 하나 이상이면 Scrapling `ProxyRotator`를 생성한다.
 

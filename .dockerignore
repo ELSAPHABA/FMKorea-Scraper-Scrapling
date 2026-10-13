@@ -1,0 +1,14 @@
+.git
+.env
+.venv
+__pycache__
+*.pyc
+docs
+tests
+infra/cdk
+outputs
+.crawl
+.smoke
+Checkpoint.json
+aidlc-workflows
+aidlc
